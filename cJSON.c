@@ -1360,9 +1360,27 @@ CJSON_PUBLIC(cJSON_bool) cJSON_PrintPreallocated(cJSON *item, char *buffer, cons
 }
 
 /* Parser core - when encountering text, process appropriately. */
+/*
+ * parse_value
+ * ------------------------------------------------------------------------------------------------------------------------
+ * 作用：JSON 解析器的指挥中心，根据当前字符分发出具体的解析任务，分发给对应的解析函数（如 parse_string、parse_array 等）。
+ * 参数说明：
+ * item         : 指向当前需要填充数据的 cJSON 节点。
+ * input_buffer : 包含待解析字符串、偏移量等上下文信息的缓冲区结构体。
+ * 返回值：
+ * cJSON_bool (true/false) : 解析成功返回 true，否则返回 false。
+ * 内存管理规则：
+ * 该函数本身不分配内存，但它调用的 parse_array 或 parse_object 等函数
+ * 会通过 cJSON_New_Item 在堆上创建新节点，需手动调用 cJSON_Delete 释放。
+ */
 static cJSON_bool parse_value(cJSON * const item, parse_buffer * const input_buffer)
 {
-    if ((input_buffer == NULL) || (input_buffer->content == NULL))
+/* * 算法逻辑：
+ * 1. 安全检查：确保输入缓冲区及内容有效，防止空指针非法访问。
+ * 2. 核心调度：通过 switch-case 结构，根据 JSON 语法的起始特征字符（如 { [ " 等）
+ * 跳转到对应的专用解析函数（如 parse_object, parse_array）。
+ */
+    if ((input_buffer == NULL) || (input_buffer->content == NULL))/* 严谨性：JSON 规范要求输入不能为空 */
     {
         return false; /* no input */
     }
@@ -1401,11 +1419,13 @@ static cJSON_bool parse_value(cJSON * const item, parse_buffer * const input_buf
         return parse_number(item, input_buffer);
     }
     /* array */
+    /* 关键行：识别到左中括号 '['，确认当前值为数组类型，调用递归解析函数 */
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == '['))
     {
         return parse_array(item, input_buffer);
     }
     /* object */
+    /* 关键行：识别到左大括号 '{'，确认当前值为对象类型（键值对结构） */
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == '{'))
     {
         return parse_object(item, input_buffer);

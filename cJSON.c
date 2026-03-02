@@ -1542,7 +1542,7 @@ static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buf
 *head 用来最终挂到 item->child
 */
 
-    if (input_buffer->depth >= CJSON_NESTING_LIMIT /*input_buffer 用于记录当前 JSON 解析的嵌套深度*/
+    if (input_buffer->depth >= CJSON_NESTING_LIMIT) /*input_buffer 用于记录当前 JSON 解析的嵌套深度*/
                                                    /*CJSON_NESTING_LIMIT是cJSON 预设的最大嵌套深度阈值，超过这个值就判定为 “过深嵌套”*/
     {
         return false; /* to deeply nested */ /* 嵌套层级过深，防止栈溢出或 DoS 攻击 */

@@ -1074,6 +1074,7 @@ static cJSON_bool print_string(const cJSON * const item, printbuffer * const p)
 }
 
 /* Predeclare these prototypes. */
+/*函数入口*/
 static cJSON_bool parse_value(cJSON * const item, parse_buffer * const input_buffer);
 static cJSON_bool print_value(const cJSON * const item, printbuffer * const output_buffer);
 static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buffer);
@@ -1420,6 +1421,7 @@ static cJSON_bool parse_value(cJSON * const item, parse_buffer * const input_buf
     }
     /* array */
     /* 关键行：识别到左中括号 '['，确认当前值为数组类型，调用递归解析函数 */
+    /* 安全检查：如果数组紧接着就是 ']'，说明是空数组，直接跳到成功标签 */
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == '['))
     {
         return parse_array(item, input_buffer);
@@ -1509,14 +1511,41 @@ static cJSON_bool print_value(const cJSON * const item, printbuffer * const outp
 }
 
 /* Build an array from input text. */
+/**
+ * @brief  解析 JSON 数组类型（[...]），并构建 cJSON 链表结构
+ *
+ * @param  item
+ *         输出参数，指向当前 cJSON 节点，用于保存解析得到的数组结果。
+ *         成功时，其 type 会被设置为 cJSON_Array，child 指向数组首元素。
+ *
+ * @param  input_buffer
+ *         输入解析缓冲区，内部维护 JSON 字符串指针、偏移量 offset、
+ *         当前递归深度 depth 以及内存分配钩子 hooks。
+ *
+ * @return cJSON_bool
+ *         true  - 数组解析成功
+ *         false - 解析失败（语法错误、内存分配失败或嵌套过深）
+ *
+ * @note
+ * - 本函数会递归调用 parse_value 解析数组元素；
+ * - 数组元素通过 cJSON 的双向链表结构串联；
+ * - 若解析失败，会释放已分配的节点，避免内存泄漏。
+ */
 static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buffer)
 {
-    cJSON *head = NULL; /* head of the linked list */
-    cJSON *current_item = NULL;
+    cJSON *head = NULL; /* head of the linked list */ /* 指向数组链表的第一个元素 */
+    cJSON *current_item = NULL; /* 指向当前正在处理的数组元素 */
+/**
+*为什么这样设计？
+*JSON 数组是变长的
+*用 链表 而不是数组，避免提前统计元素数量
+*head 用来最终挂到 item->child
+*/
 
-    if (input_buffer->depth >= CJSON_NESTING_LIMIT)
+    if (input_buffer->depth >= CJSON_NESTING_LIMIT /*input_buffer 用于记录当前 JSON 解析的嵌套深度*/
+                                                   /*CJSON_NESTING_LIMIT是cJSON 预设的最大嵌套深度阈值，超过这个值就判定为 “过深嵌套”*/
     {
-        return false; /* to deeply nested */
+        return false; /* to deeply nested */ /* 嵌套层级过深，防止栈溢出或 DoS 攻击 */
     }
     input_buffer->depth++;
 
@@ -1524,6 +1553,11 @@ static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buf
     {
         /* not an array */
         goto fail;
+/*
+*为什么不用 return？
+*因为后面可能已经分配了内存，
+*goto fail 能统一释放资源，避免内存泄漏（这是 C 里经典写法）
+*/
     }
 
     input_buffer->offset++;
@@ -1531,10 +1565,12 @@ static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buf
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == ']'))
     {
         /* empty array */
+        /* 空数组 []，不需要创建子节点 */
         goto success;
     }
 
     /* check if we skipped to the end of the buffer */
+    /*安全检查，检查是否越界（是否错过了]）*/
     if (cannot_access_at_index(input_buffer, 0))
     {
         input_buffer->offset--;

@@ -1550,7 +1550,7 @@ static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buf
      * 算法逻辑：解析嵌套结构前递增深度，退出/失败时递减深度
      * 安全规则：深度超过阈值则拒绝解析，防止栈溢出和DoS攻击
      */
-    // 检查当前嵌套深度是否超过预设阈值（默认1000层）
+    /* 检查当前嵌套深度是否超过预设阈值（默认1000层）*/
 
     if (input_buffer->depth >= CJSON_NESTING_LIMIT) /*input_buffer 用于记录当前 JSON 解析的嵌套深度*/
                                                     /*CJSON_NESTING_LIMIT是cJSON 预设的最大嵌套深度阈值，超过这个值就判定为 “过深嵌套”*/

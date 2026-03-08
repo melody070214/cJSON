@@ -250,27 +250,76 @@ static cJSON *cJSON_New_Item(const internal_hooks * const hooks)
 }
 
 /* Delete a cJSON structure. */
+
+/**
+ * @brief 递归释放 cJSON 树及其关联的所有内存资源
+ * * @details 该函数是 cJSON 内存管理的核心入口。它不仅释放传入的节点本身，还会递归地
+ * 销毁该节点下属的所有子节点（child）以及其后随的所有兄弟节点（next）。
+ * * @section memory_management 内存管理说明
+ * - **后序遍历思想**: 函数通过递归深度优先遍历，确保最底层的叶子节点先被释放。
+ * - **所有权检查**: 只有当节点不含 `cJSON_IsReference` 标志时，才会释放 `valuestring`。
+ * - **钩子函数调用**: 实际的内存回收由 `global_hooks.deallocate`（通常是 free）完成。
+ * * @param[in] item 指向待删除 cJSON 结构体的指针。如果为 NULL，函数将安全返回。
+ * * @note 
+ * 1. 调用此函数后，传入的指针 `item` 在主调函数中将变为野指针，建议手动置为 NULL。
+ * 2. 采用 while 循环迭代处理 `next` 指针，而非纯递归，是为了优化堆栈消耗，防止处理长数组时崩溃。
+ * * @par 逻辑流程:
+ * 1. 暂存 `next` 节点防止断链。
+ * 2. 递归释放 `child` 分支。
+ * 3. 释放 `valuestring` 数据（如果拥有所有权）。
+ * 4. 释放 `string` 键名（如果非静态常量）。
+ * 5. 释放当前 `item` 结构体并移动到 `next`。
+ */
+
 CJSON_PUBLIC(void) cJSON_Delete(cJSON *item)
 {
+
+    /* 辅助指针，用于在释放当前节点前保存链表的后续位置 */
     cJSON *next = NULL;
+
+    /** @loop 迭代处理当前层级的所有兄弟节点 */
     while (item != NULL)
     {
+        /* --- [关键操作: 暂存指针] --- */
+        /** 提前获取下一个节点，因为后续 global_hooks.deallocate(item) 会销毁当前节点数据 */
+
         next = item->next;
+
+        /* --- [第一阶段: 递归处理子树] --- */
+        /** * 如果当前节点拥有子节点且非引用类型，递归调用自身进入下一层级。
+         * 这里体现了树状链表的深度优先销毁策略。
+         */
+
         if (!(item->type & cJSON_IsReference) && (item->child != NULL))
         {
             cJSON_Delete(item->child);
         }
+
+        /* --- [第二阶段: 释放内容数据] --- */
+        /** 只有当节点拥有该字符串的所有权（非引用）时，才调用内存释放钩子 */
+
         if (!(item->type & cJSON_IsReference) && (item->valuestring != NULL))
         {
             global_hooks.deallocate(item->valuestring);
-            item->valuestring = NULL;
+            item->valuestring = NULL; /* 防御性编程：置空防止二次释放 */
         }
+
+        /* --- [第三阶段: 释放对象键名] --- */
+        /** * 处理作为 Object 成员时的 Key 值。
+         * 如果 Key 是通过 cJSON_AddItemToObject 动态分配的（非 Const），则必须释放。
+         */
         if (!(item->type & cJSON_StringIsConst) && (item->string != NULL))
         {
             global_hooks.deallocate(item->string);
             item->string = NULL;
         }
+
+        /* --- [第四阶段: 销毁节点本身] --- */
+        /** 最终回收 cJSON 结构体所占用的内存块 */
         global_hooks.deallocate(item);
+
+        /* --- [第五阶段: 步进] --- */
+        /** 移动到之前暂存的 next 节点，继续 while 循环 */
         item = next;
     }
 }
@@ -479,6 +528,7 @@ typedef struct
     cJSON_bool noalloc;
     cJSON_bool format; /* is this print a formatted print */
     internal_hooks hooks;
+    int indent_size;   /* custom indent width */
 } printbuffer;
 
 /* realloc printbuffer if necessary to have at least "needed" bytes more */
@@ -815,7 +865,23 @@ fail:
     return 0;
 }
 
-/* Parse the input text into an unescaped cinput, and populate item. */
+/* Parse the input text into an unescaped cinput, and populate item. */\
+
+/**
+ * @brief 解析 JSON 字符串并处理转义序列
+ * * @details 该函数负责将 JSON 格式的字符串（带引号且可能包含转义字符）解析为 C 语言字符串。
+ * 其核心逻辑分为三个阶段：
+ * 1. **预扫描 (Pre-scan)**：遍历输入以计算解析后字符串所需的实际内存长度（排除转义符占用的多余空间）。
+ * 2. **内存分配**：根据计算出的长度分配堆内存。
+ * 3. **解码填充**：处理反斜杠（\）引导的转义序列（如 \n, \r, \t, \uXXXX 等）。
+ * * @param item 指向当前待填充数据成员的 cJSON 结构体。
+ * @param input 指向原始 JSON 文本流的指针，起始位置应为双引号 '"'。
+ * * @return const char* 返回解析结束后的后续文本指针；若解析失败（如内存不足或格式错误）则返回 NULL。
+ * * @note
+ * - **安全性**：通过先预计算长度再分配内存，有效防止了缓冲区溢出风险。
+ * - **编码处理**：支持将 \uXXXX 的 Unicode 序列转换为 UTF-8 编码存储。
+ */
+
 static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_buffer)
 {
     const unsigned char *input_pointer = buffer_at_offset(input_buffer) + 1;
@@ -824,86 +890,107 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
     unsigned char *output = NULL;
 
     /* not a string */
+    /* --- [阶段 1: 长度预估算与安全性检查] --- */
+    /** @check 验证输入流的第一个字符是否为引号 */
+
     if (buffer_at_offset(input_buffer)[0] != '\"')
     {
-        goto fail;
+        goto fail; /* 非字符串开头，跳转至错误处理 */
     }
 
     {
         /* calculate approximate size of the output (overestimate) */
+        /* 统计跳过的转义字符数量，用于精确计算内存需求 */
         size_t allocation_length = 0;
         size_t skipped_bytes = 0;
+
+        /** @loop 扫描直到遇到结束引号或缓冲区末尾 */
         while (((size_t)(input_end - input_buffer->content) < input_buffer->length) && (*input_end != '\"'))
         {
             /* is escape sequence */
             if (input_end[0] == '\\')
             {
+                /* 防御性编程：防止反斜杠出现在输入流最后一个字符导致越界 */
                 if ((size_t)(input_end + 1 - input_buffer->content) >= input_buffer->length)
                 {
                     /* prevent buffer overflow when last input character is a backslash */
                     goto fail;
                 }
-                skipped_bytes++;
+                skipped_bytes++; /* 转义符本身不计入最终输出长度 */
                 input_end++;
             }
             input_end++;
         }
+
+        /* 意外结束检查（未发现匹配的结束引号） */
         if (((size_t)(input_end - input_buffer->content) >= input_buffer->length) || (*input_end != '\"'))
         {
             goto fail; /* string ended unexpectedly */
         }
 
+        /* --- [阶段 2: 内存申请] --- */
+        /** @allocate 精确分配内存：原始长度 - 转义损耗 + 结束符 '\0' */
         /* This is at most how much we need for the output */
         allocation_length = (size_t) (input_end - buffer_at_offset(input_buffer)) - skipped_bytes;
         output = (unsigned char*)input_buffer->hooks.allocate(allocation_length + sizeof(""));
         if (output == NULL)
         {
-            goto fail; /* allocation failure */
+            goto fail; /* allocation failure */ /* 内存分配失败处理 */
         }
     }
 
     output_pointer = output;
+
+    /* --- [阶段 3: 内容转换循环] --- */
+    /** @loop 再次遍历并进行转义序列的解析映射 */
     /* loop through the string literal */
     while (input_pointer < input_end)
     {
         if (*input_pointer != '\\')
         {
+            /* 普通字符：直接写入输出流 */
             *output_pointer++ = *input_pointer++;
         }
         /* escape sequence */
         else
         {
+            /* 处理转义序列 */
             unsigned char sequence_length = 2;
+
+            /* 剩余长度检查：反斜杠后至少需有一个字符 */
             if ((input_end - input_pointer) < 1)
             {
                 goto fail;
             }
 
+            /** @switch 分支处理常见的 JSON 转义字符 */
             switch (input_pointer[1])
             {
                 case 'b':
                     *output_pointer++ = '\b';
-                    break;
+                    break;/* 退格 */
                 case 'f':
                     *output_pointer++ = '\f';
-                    break;
+                    break;/* 换页 */
                 case 'n':
                     *output_pointer++ = '\n';
-                    break;
+                    break;/* 换行 */
                 case 'r':
                     *output_pointer++ = '\r';
-                    break;
+                    break;/* 回车 */
                 case 't':
                     *output_pointer++ = '\t';
-                    break;
+                    break;/* 制表符 */
                 case '\"':
                 case '\\':
                 case '/':
-                    *output_pointer++ = input_pointer[1];
+                    *output_pointer++ = input_pointer[1]; /* 处理 \", \\, \/ */
                     break;
 
                 /* UTF-16 literal */
                 case 'u':
+                    /** @details 解析 UTF-16 转 UTF-8。这是 cJSON 处理多字节字符的核心函数调用。 */
+
                     sequence_length = utf16_literal_to_utf8(input_pointer, input_end, &output_pointer);
                     if (sequence_length == 0)
                     {
@@ -913,30 +1000,37 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
                     break;
 
                 default:
-                    goto fail;
+                    goto fail; /* 不识别的转义序列 */
             }
             input_pointer += sequence_length;
         }
     }
 
+    /* --- [阶段 4: 收尾与状态更新] --- */
+    /** @terminate 添加 C 字符串结束符 '\0' */
     /* zero terminate the output */
     *output_pointer = '\0';
 
+    /** @property 挂载数据到节点并同步缓冲区状态 */
     item->type = cJSON_String;
     item->valuestring = (char*)output;
 
+    /* 更新偏移量：移动到结束引号之后 */
     input_buffer->offset = (size_t) (input_end - input_buffer->content);
     input_buffer->offset++;
 
     return true;
 
+/* --- [错误处理阶段] --- */
 fail:
+    /** @free 发生任何错误时，必须回收已分配的内存，防止内存泄漏 */
     if (output != NULL)
     {
         input_buffer->hooks.deallocate(output);
         output = NULL;
     }
 
+    /* 同步解析失败时的缓冲区位置，便于上层定位错误点 */
     if (input_pointer != NULL)
     {
         input_buffer->offset = (size_t)(input_pointer - input_buffer->content);
@@ -1721,6 +1815,18 @@ fail:
     return false;
 }
 
+static void add_indent(printbuffer *p)
+{
+    int i;
+    for (i = 0; i < p->depth; i++)
+    {
+        unsigned char *ptr = ensure(p, 1);
+        if(ptr == NULL) return;
+        *ptr = '\t';   // 一个tab缩进
+        p->offset++;
+    }
+}
+
 /* Render an array to text */
 static cJSON_bool print_array(const cJSON * const item, printbuffer * const output_buffer)
 {
@@ -1741,12 +1847,31 @@ static cJSON_bool print_array(const cJSON * const item, printbuffer * const outp
         return false;
     }
 
+    if (output_buffer->format)
+    {
+        unsigned char *ptr = ensure(output_buffer, 1);
+        *ptr = '\n';
+        output_buffer->offset++;
+
+        add_indent(output_buffer);
+    }
+
     *output_pointer = '[';
     output_buffer->offset++;
     output_buffer->depth++;
 
     while (current_element != NULL)
     {
+
+        if (output_buffer->format)
+        {
+            unsigned char *ptr = ensure(output_buffer, 1);
+            *ptr = '\n';
+            output_buffer->offset++;
+
+            add_indent(output_buffer);
+        }
+
         if (!print_value(current_element, output_buffer))
         {
             return false;
@@ -2054,11 +2179,11 @@ static cJSON_bool print_object(const cJSON * const item, printbuffer * const out
             {
                 return false;
             }
-            for (i = 0; i < output_buffer->depth; i++)
+            for (i = 0; i < output_buffer->depth * output_buffer->indent_size; i++)
             {
-                *output_pointer++ = '\t';
+                *output_pointer++ = ' ';
             }
-            output_buffer->offset += output_buffer->depth;
+            output_buffer->offset += output_buffer->depth * output_buffer->indent_size;
         }
 
         /* print key */
@@ -3438,4 +3563,20 @@ CJSON_PUBLIC(void) cJSON_free(void *object)
 {
     global_hooks.deallocate(object);
     object = NULL;
+}
+char *cJSON_PrintPretty(const cJSON *item, int indent)
+{
+    printbuffer buffer;
+
+    memset(&buffer, 0, sizeof(buffer));
+
+    buffer.format = true;
+    buffer.indent_size = indent;
+
+    if (!print_value(item, &buffer))
+    {
+        return NULL;
+    }
+
+    return (char*)buffer.buffer;
 }

@@ -1784,107 +1784,218 @@ static cJSON_bool print_array(const cJSON * const item, printbuffer * const outp
 }
 
 /* Build an object from the text. */
-static cJSON_bool parse_object(cJSON * const item, parse_buffer * const input_buffer)
+/**
+ * @brief  解析输入缓冲区中的 JSON 对象（由 {} 包裹的键值对集合），构建对应的 cJSON 树形结构
+ *
+ * @param  item
+ *         输入输出参数：指向预分配的空 cJSON 节点，用于承载解析后的对象结果。
+ *         解析成功时：
+ *         - 节点 type 被设置为 cJSON_Object（标识该节点为对象类型）；
+ *         - child 指针指向对象第一个键值对节点（后续子节点通过双向链表串联）；
+ *         - 该节点的生命周期由调用者管理，需手动调用 cJSON_Delete() 释放。
+ *
+ * @param  input_buffer
+ *         输入输出参数：解析上下文缓冲区，核心字段说明：
+ *         - ptr/offset：指向待解析 JSON 字符串及当前解析偏移量；
+ *         - depth：当前递归解析深度（用于限制最大嵌套层级）；
+ *         - hooks：内存分配/释放钩子（默认使用 malloc/free，支持自定义内存池）；
+ *         解析过程中会自动更新 offset 和 depth，失败时可通过 offset 定位错误位置。
+ *
+ * @return cJSON_bool
+ *         true  - 对象解析成功，item 节点已填充完整的对象数据及子节点链表；
+ *         false - 对象解析失败，失败场景包括：
+ *                 1) JSON 语法错误（缺少 {} / : / ,、键非字符串等）；
+ *                 2) 内存分配失败（子节点 malloc 失败）；
+ *                 3) 嵌套深度超过 CJSON_NESTING_LIMIT（默认 1000，防止栈溢出）。
+ *
+ * @note
+ * 1. 语法规则：JSON 对象由若干键值对组成，键必须是字符串类型，格式为 "key" : value，多键值对用 , 分隔；
+ * 2. 节点结构：对象的每个键值对均为独立 cJSON 节点，键名存在节点的 string 字段，值存在对应类型字段（如 valuestring/valuedouble）；
+ * 3. 链表结构：对象所有子节点通过双向循环链表连接（head->prev 指向尾节点，尾节点->next 指向 head），遍历效率更高；
+ * 4. 递归解析：本函数会调用 parse_value() 递归解析每个 value（支持嵌套对象/数组/字符串/数字等所有 JSON 类型）；
+ * 5. 内存管理：
+ *    - 解析失败时，函数内部会自动释放已分配的所有子节点，避免内存泄漏；
+ *    - 解析成功时，子节点内存由 item 节点托管，调用者仅需释放 item 即可递归释放整个对象树；
+ *    - 禁止单独释放子节点（如 item->child），否则会导致内存重复释放或泄漏；
+ * 6. 空白兼容：函数会自动跳过 JSON 语法允许的空白字符（空格/制表符/换行/回车），兼容灵活的 JSON 格式。
+ * 7. 对象成员在内部存储为 key-value 结构，其中 key 存储在 string 字段中。
+ */static cJSON_bool parse_object(cJSON * const item, parse_buffer * const input_buffer)
 {
+    /* 对象子节点链表的头指针，用于串联所有键值对节点 */
     cJSON *head = NULL; /* linked list head */
-    cJSON *current_item = NULL;
+    cJSON *current_item = NULL; /* 链表游标，指向当前正在解析的键值对节点，用于构建双向链表 */
+
+    /* ===================== 代码块：嵌套深度安全校验 ===================== */
+    /* 算法逻辑：限制 JSON 最大嵌套深度，防止恶意构造的深层嵌套 JSON 导致栈溢出/内存耗尽
+       安全设计：cJSON 预设最大嵌套深度为 CJSON_NESTING_LIMIT（默认 1000），超过则直接失败 */
 
     if (input_buffer->depth >= CJSON_NESTING_LIMIT)
     {
+     /* 关键行：嵌套深度超限，返回失败，无内存分配故无需释放 */
         return false; /* to deeply nested */
     }
-    input_buffer->depth++;
+    input_buffer->depth++; /* 关键行：进入对象层级，嵌套深度+1，与解析完成后的 depth-- 配对，保证深度准确 */
+
+    /* ===================== 代码块：校验对象起始符 { ===================== */
+    /* 算法逻辑：JSON 对象必须以 { 开头，先检查缓冲区是否越界，再检查当前字符是否为 {
+       边界防护：cannot_access_at_index 确保指针不越界，避免内存访问错误 */
 
     if (cannot_access_at_index(input_buffer, 0) || (buffer_at_offset(input_buffer)[0] != '{'))
     {
-        goto fail; /* not an object */
+        goto fail; /* not an object */  /*非 { 开头，不符合 JSON 对象语法，跳转到错误处理分支 */
     }
 
-    input_buffer->offset++;
+    input_buffer->offset++; /* 关键行：跳过 { 字符，偏移量+1，指向后续待解析内容，符合 JSON 解析的指针移动规则*/
+
+    /* 关键行：跳过 { 后的所有空白字符（空格/制表符/换行/回车），符合 JSON 规范（JSON 允许符号间任意空白） */
     buffer_skip_whitespace(input_buffer);
+
+    /* ===================== 代码块：空对象快速处理 ===================== */
+    /* 算法逻辑：空对象（{}）无需解析键值对，直接标记成功，提升解析效率
+       边界条件：跳过空白后直接遇到 }，判定为空对象 */
     if (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == '}'))
     {
-        goto success; /* empty object */
+        goto success; /* empty object */  /* 关键行：空对象快速返回，跳转到成功处理分支，避免无效循环 */
     }
 
     /* check if we skipped to the end of the buffer */
+    /* ===================== 代码块：缓冲区边界最终校验 ===================== */
+    /* 算法逻辑：跳过空白后已到缓冲区末尾，但未遇到 }，属于非法 JSON（对象未闭合）
+       错误还原：回退偏移量，让调用者能准确定位错误位置 */
     if (cannot_access_at_index(input_buffer, 0))
     {
-        input_buffer->offset--;
-        goto fail;
+        input_buffer->offset--; /*回退偏移量到最后有效位置，保证错误位置准确 */
+        goto fail; /* 缓冲区越界，对象未闭合，解析失败 */
     }
 
     /* step back to character in front of the first element */
+    /* 关键行：回退偏移量1位，抵消后续 do-while 中 offset++，保证键值对解析起始位置正确 */
+
     input_buffer->offset--;
+
+    /* ===================== 代码块：循环解析所有键值对（核心逻辑） ===================== */
+    /* 算法逻辑：
+       1. 采用 do-while 循环而非 while 循环：保证非空对象至少解析1个键值对（符合 JSON 语法，非空对象至少有1个键值对）
+       2. 每次循环解析一个键值对（键名+冒号+值），并将节点挂载到双向链表
+       3. 循环终止条件：遇到 }（对象结束）或非法字符 */
     /* loop through the comma separated array elements */
     do
     {
         /* allocate next item */
+        /* --------------------- 子代码块：分配键值对节点 --------------------- */
+        /* 内存分配逻辑：
+           1. 使用 input_buffer->hooks 中的自定义分配函数（默认是 malloc），支持内存池/自定义内存管理
+           2. 分配失败则直接失败，避免空指针访问 */
+
         cJSON *new_item = cJSON_New_Item(&(input_buffer->hooks));
         if (new_item == NULL)
         {
-            goto fail; /* allocation failure */
+            goto fail; /* allocation failure */ /* 关键行：内存分配失败，跳转到错误分支释放已分配节点，避免内存泄漏 */
         }
 
+
         /* attach next item to list */
+        /* --------------------- 子代码块：构建双向循环链表 --------------------- */
+        /* 算法逻辑：
+           cJSON 对象的子节点采用双向循环链表存储，优点是：
+           1. 支持正序/逆序遍历，遍历效率高；
+           2. 链表头 prev 指向尾节点，尾节点 next 指向头节点，无断链风险 */
+
         if (head == NULL)
         {
             /* start the linked list */
+            /* 关键行：首次解析，链表为空，头指针和游标都指向第一个节点 */
+
             current_item = head = new_item;
-        }
+         }
         else
         {
             /* add to the end and advance */
-            current_item->next = new_item;
-            new_item->prev = current_item;
-            current_item = new_item;
+            current_item->next = new_item; /* 关键行：当前节点 next 指向新节点，构建正向链表 */
+
+            new_item->prev = current_item; /* 关键行：新节点 prev 指向当前节点，构建反向链表 */
+
+            current_item = new_item;  /* 关键行：游标后移，指向最新节点，为下一次循环做准备 */
+
         }
+
+        /* ===================== 代码块：逗号后边界检查 ===================== */
+        /* 语法规则：JSON 中逗号 ',' 后必须跟随下一个键值对，不能直接结束
+           边界防护：检查缓冲区偏移+1的位置是否越界，若越界则说明逗号后无内容，非法 */
+
 
         if (cannot_access_at_index(input_buffer, 1))
         {
-            goto fail; /* nothing comes after the comma */
+            goto fail; /* nothing comes after the comma */ /* 关键行：逗号后无有效内容，违反 JSON 语法，解析失败 */
         }
+         /* ===================== 代码块：解析键名（JSON 对象的键必须是字符串） ===================== */
+         /* 算法逻辑：键名必须是字符串，调用 parse_string 解析，结果暂存到 current_item->valuestring
+            指针移动：offset++ 跳过逗号，指向键名起始位置 */
 
         /* parse the name of the child */
-        input_buffer->offset++;
-        buffer_skip_whitespace(input_buffer);
-        if (!parse_string(current_item, input_buffer))
+        input_buffer->offset++; /* 关键行：偏移量+1，跳过冒号，指向值的起始位置 */
+        buffer_skip_whitespace(input_buffer); /* 关键行：跳过值前的空白字符，符合 JSON 规范 */
+
+        if (!parse_string(current_item, input_buffer)) /* 递归解析键对应的值 */
+
         {
-            goto fail; /* failed to parse name */
+            goto fail; /* failed to parse name */ /* 关键行：值解析失败（类型错误/格式错误），解析终止 */
         }
         buffer_skip_whitespace(input_buffer);
+        /* ===================== 代码块：键名字段迁移 ===================== */
+        /* 设计背景：parse_string 函数会将解析结果默认存入 valuestring 字段，
+           但 cJSON 规定：对象的键名需存储在 string 字段，valuestring 留给值使用。
+           操作逻辑：将暂存的键名从 valuestring 迁移到 string，清空 valuestring 避免冲突。 */
 
         /* swap valuestring and string, because we parsed the name */
-        current_item->string = current_item->valuestring;
-        current_item->valuestring = NULL;
+
+        current_item->string = current_item->valuestring; /* 关键行：迁移键名到专属的 string 字段 */
+        current_item->valuestring = NULL; /* 关键行：迁移键名到专属的 string 字段 */
+
+        /* ===================== 代码块：校验键值分隔符「:」 ===================== */
+        /* 语法规则：JSON 对象的键值对必须用冒号分隔，冒号是语法核心分隔符。
+           边界防护：先判断缓冲区是否越界，再校验当前字符是否为冒号，双重保障避免非法访问。 */
 
         if (cannot_access_at_index(input_buffer, 0) || (buffer_at_offset(input_buffer)[0] != ':'))
         {
-            goto fail; /* invalid object */
+            goto fail; /* invalid object */ /* 关键行：缺少冒号或缓冲区越界，属于非法对象格式，跳转错误处理 */
         }
 
+        /* ===================== 代码块：递归解析键对应的值 ===================== */
+        /* 核心逻辑：值可以是字符串、数字、数组、嵌套对象等任意 JSON 类型，
+           因此调用 parse_value 分发解析，完成递归嵌套的核心逻辑。 */
+
         /* parse the value */
-        input_buffer->offset++;
+        input_buffer->offset++; /*跳过冒号，将偏移量指向值的起始位置 */
         buffer_skip_whitespace(input_buffer);
         if (!parse_value(current_item, input_buffer))
         {
             goto fail; /* failed to parse value */
         }
-        buffer_skip_whitespace(input_buffer);
+        buffer_skip_whitespace(input_buffer); /*跳过值后的空白，为判断逗号/结束符做准备 */
     }
     while (can_access_at_index(input_buffer, 0) && (buffer_at_offset(input_buffer)[0] == ','));
+
+    /* ===================== 代码块：校验对象结束符「}」 ===================== */
+    /* 语法规则：JSON 对象必须以右大括号闭合，否则为未完成的非法对象。
+       错误定位：校验失败时，当前 offset 即为缺失结束符的错误位置，供上层排查。 */
 
     if (cannot_access_at_index(input_buffer, 0) || (buffer_at_offset(input_buffer)[0] != '}'))
     {
         goto fail; /* expected end of object */
     }
 
+/* ===================== 代码块：解析成功处理 ===================== */
 success:
-    input_buffer->depth--;
-
+    input_buffer->depth--; /* 关键行：退出当前对象层级，嵌套深度-1，与开头 depth++ 配对，保证深度平衡 */
+    /* 链表收尾：将双向链表转为循环链表（cJSON 标准设计）
+       原因：循环链表无需判断尾节点（head->prev 就是尾节点），遍历更高效 */
     if (head != NULL) {
-        head->prev = current_item;
+        head->prev = current_item; /* 关键行：头节点 prev 指向尾节点，完成循环链表构建 */
     }
+    /* 填充根节点：
+       1. type 标记为 cJSON_Object，标识该节点是对象类型；
+       2. child 指向子节点链表头，调用者可通过 item->child 遍历所有键值对 */
 
     item->type = cJSON_Object;
     item->child = head;
@@ -1892,13 +2003,17 @@ success:
     input_buffer->offset++;
     return true;
 
+/* ===================== 代码块：解析失败统一处理 ===================== */
 fail:
+       /* 内存管理：
+          cJSON_Delete 会递归释放节点及其所有子节点，因此只需释放 head 即可释放整个键值对链表
+          保证：无论解析失败发生在哪个阶段，所有已分配的临时节点都会被释放，无内存泄漏 */
     if (head != NULL)
     {
-        cJSON_Delete(head);
+        cJSON_Delete(head);/* 释放所有已分配的子节点链表 */
     }
 
-    return false;
+    return false; /* 解析失败，返回 false，调用者可通过 input_buffer->offset 定位错误位置 */
 }
 
 /* Render an object to text. */

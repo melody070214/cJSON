@@ -583,6 +583,16 @@ When cJSON was originally created, it didn't follow the JSON standard and didn't
 
 cJSON supports parsing and printing JSON that contains objects that have multiple members with the same name. `cJSON_GetObjectItemCaseSensitive` however will always only return the first one.
 
+---
+## 个人课程实践记录
+本项目是在 cJSON 官方库基础上完成的课程作业，包含以下阶段：
+
+1.  **环境搭建**：在 Linux 下配置 C 开发环境，克隆并编译 cJSON 源码，验证测试用例。
+2.  **源码分析**：分析核心数据结构与解析流程，为 `cJSON_Delete`、`parse_object` 等函数添加详细注释。
+3.  **功能扩展**：实现 JSON 格式化输出（Pretty Print），编写测试用例，解决 CI 编译冲突问题。
+
+详细开发记录与版本变更：[MELODY_CHANGELOG.md](./MELODY_CHANGELOG.md)
+完整提交历史：https://github.com/melody070214/cJSON/commits/master
 # Enjoy cJSON!
 
 - Dave Gamble (original author)
